@@ -40,7 +40,16 @@ from .job_schema import (
 )
 from .job_schema import retry_fields as source_retry_fields
 from .lyric_availability import LyricAvailability
-from .room import AddSong, Room, RoomCommand, Updates, artifact_url
+from .room import (
+    REMOTE_ID,
+    AddSong,
+    RemoteCommand,
+    RemoteState,
+    Room,
+    RoomCommand,
+    Updates,
+    artifact_url,
+)
 from .video_search import SearchCursorExpired, VideoSearch
 
 ROOT = Path(__file__).resolve().parent
@@ -885,9 +894,26 @@ def create_app(data_dir=None, *, worker_command=None, version=None, cache_limit_
         return room.snapshot()
 
     @app.get('/v1/room/events')
-    async def room_events(job_id: str | None = None, playing_entry_id: str | None = None):
-        return StreamingResponse(room.events(job_id, playing_entry_id), media_type='text/event-stream',
-            headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+    async def room_events(job_id: str | None = None, playing_entry_id: str | None = None,
+                          display_id: str | None = Query(default=None, pattern=REMOTE_ID),
+                          display_session: str | None = Query(default=None, pattern=REMOTE_ID),
+                          display_name: str = Query(default='播放屏', min_length=1, max_length=40),
+                          watch: bool = False):
+        if bool(display_id) != bool(display_session) or (watch and display_id):
+            raise HTTPException(422, '播放屏需要编号和会话，且不能同时是遥控')
+        display = (display_id, display_session, display_name) if display_id else None
+        return StreamingResponse(room.events(job_id, playing_entry_id, display=display, watch=watch),
+            media_type='text/event-stream', headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+    @app.post('/v1/remote/displays/{display_id}/state')
+    async def remote_state(display_id: str, payload: RemoteState):
+        room.remote.report(display_id, payload)
+        return dict(seq=payload.seq)
+
+    @app.post('/v1/remote/displays/{display_id}/commands', status_code=202)
+    async def remote_command(display_id: str, payload: RemoteCommand):
+        room.remote.command(display_id, payload)
+        return dict(command_id=payload.command_id)
 
     @app.post('/v1/room/events', status_code=204)
     async def notify_room_events():

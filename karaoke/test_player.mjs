@@ -1,6 +1,7 @@
 import test, {beforeEach} from 'node:test';
 import assert from 'node:assert/strict';
 import {Player} from './web/player.js';
+import {RemoteControl, RemoteDisplay} from './web/remote.js';
 import {isStaleRoomSnapshot, applyRoomPatch, LocalPlayback, PlaybackTabs, RoomEvents, queueToTop, queueTopCandidates, preparationRetry} from './web/room-state.js';
 
 test('room subscriptions recover closed and silent connections without polling or accepting old events', t => {
@@ -1847,3 +1848,147 @@ for (const outcome of ['recovers', 'stays stuck', 'cancelled']) {
     } finally { p.clear(); for (const resolve of pending) resolve(); globalThis.fetch=fetchAudio; }
   });
 }
+
+function remoteDisplay({post = async () => {}} = {}) {
+  const ran=[], sent=[], live={entry:'a', locked:false, noPitch:false, position:0, started_at:null, server:100};
+  const display=new RemoteDisplay('tv', async (path,body) => { sent.push({path,...body}); return post(body); }, {
+    state:() => ({phase:'playing',entry_id:live.entry,position:live.position,started_at:live.started_at}), entry:() => live.entry, locked:() => live.locked,
+    pitchUnavailable:() => live.noPitch,
+    run:async action => { ran.push(action); if (action==='next') live.entry='b'; return true; },
+  }, () => live.server - Date.now()/1000);
+  display.start('tab');
+  const receive=(command_id,action,extra={}) => display.receive({command_id,session:'tab',action,entry_id:'a',expires_at:105,...extra});
+  const results=() => Object.fromEntries(sent.flatMap(body=>body.results).map(item=>[item.command_id,item.status]));
+  return {display,ran,sent,live,receive,results};
+}
+const settle = async () => { for (let i=0;i<20;i++) await Promise.resolve(); };
+
+test('a display runs each remote command once, for the right song, in time, and only for its own session', async () => {
+  const {display,ran,live,receive,results}=remoteDisplay();
+  await Promise.all([receive('n1','next'), receive('n2','next'), receive('n1','next')]);
+  assert.deepEqual(ran,['next']); // A double tap must not skip two songs.
+  await receive('late','pause',{entry_id:'b',expires_at:99});
+  await receive('old-tab','pause',{entry_id:'b',session:'other'});
+  await receive('pitch-old','pitch',{pitch_semitones:2});
+  live.noPitch=true; await receive('pitch','pitch',{entry_id:'b',pitch_semitones:2});
+  await receive('lead','lead',{entry_id:undefined,level:.5});
+  assert.deepEqual(ran,['next','lead']);
+  await settle();
+  assert.deepEqual(results(),{n1:'applied',n2:'stale',late:'expired','pitch-old':'stale',pitch:'unavailable',lead:'applied'});
+  display.stop();
+  await receive('closed','pause',{entry_id:'b'});
+  assert.deepEqual(ran,['next','lead']);
+});
+
+test('a display without sound permission refuses to start but still pauses, removes and adjusts levels', async () => {
+  const {ran,live,receive,results}=remoteDisplay(); live.locked=true;
+  for (const action of ['play','restart','next','seek']) await receive(action,action);
+  for (const action of ['pause','lead','pitch','remove']) await receive(action,action);
+  await settle();
+  assert.deepEqual(ran,['pause','lead','pitch','remove']);
+  assert.deepEqual(['play','restart','next','seek'].map(id=>results()[id]),Array(4).fill('locked'));
+});
+
+test('a display reports only changes, one request at a time, and recovers a dropped report', async t => {
+  t.mock.timers.enable({apis:['setTimeout']});
+  let fail=false, release;
+  const {display,sent,live,receive}=remoteDisplay({post:() => fail ? Promise.reject(new Error('offline')) : new Promise(done => { release=done; })});
+  display.report(); display.report(); live.position=5; display.report();
+  assert.equal(sent.length,1);
+  release(); await settle();
+  assert.deepEqual(sent.map(body=>body.position),[0,5]); // Only the latest waiting state.
+  release(); await settle();
+  display.report(); assert.equal(sent.length,2);
+  live.started_at=Date.now()/1000; display.report(); release(); await settle();
+  assert.ok(Math.abs(sent[2].started_at-100)<1); // Remotes share the server's clock.
+  live.server+=.004; display.report(); assert.equal(sent.length,3); // A refined offset is not news.
+  fail=true; live.position=9; await receive('p','pause'); await settle();
+  assert.equal(sent.length,4);
+  display.report(); assert.equal(sent.length,4);
+  fail=false; t.mock.timers.tick(1000);
+  assert.deepEqual(sent[4].results,[{command_id:'p',status:'applied'}]);
+  release(); await settle();
+  // A reopened connection may have lost this display; it reports again, and
+  // toggling the same session off and on must not restart the sequence.
+  display.resync(); release(); await settle();
+  display.stop(); display.start('tab'); display.report(); release(); await settle();
+  assert.deepEqual(sent.map(body=>body.seq),sent.map((_,index)=>index));
+  assert.equal(sent.length,7);
+  fail=true; display.resync(); await settle();
+  for (let i=0;i<60;i++) { display.report(); t.mock.timers.tick(500); await settle(); }
+  assert.equal(sent.length,12); // Back off at 1, 2, 4 and 8 s, however often playback ticks.
+  fail=false; display.resync(); assert.equal(sent.length,13); release(); await settle();
+});
+
+function remoteControl(options={}) {
+  const sent=[], room={entries:[{id:'a',job_id:'ja',title:'A',status:'completed',duration:100}],library:[{id:'L',job_id:'jb',title:'B',status:'completed',duration:50}]};
+  const tv=(state={},extra={}) => ({id:'tv',name:'Mac',session:'s1',results:[],...extra,
+    state:{phase:'playing',entry_id:'a',job_id:'ja',position:10,started_at:null,lead:0,lead_restore:.6,pitch:0,intro_start:null,...state}});
+  let ids=0;
+  const control=new RemoteControl({send:async (path,body) => { sent.push({path,...body}); }, changed:() => control.reconcile(room), newId:() => `c${++ids}`, ...options});
+  const receive=(...displays) => control.receive({displays});
+  return {control,room,sent,tv,receive};
+}
+
+test('a remote shows the display clock and songs that already left the queue, with nothing to play or save', t => {
+  t.mock.timers.enable({apis:['Date'],now:1_000_000});
+  const {control,room,receive,tv}=remoteControl({clockOffset:() => 50});
+  assert.equal(control.phase,'offline'); assert.equal(control.entry,null);
+  receive(tv({started_at:1045}));
+  assert.equal(control.entry.title,'A'); assert.equal(control.state.playing,true);
+  assert.equal(control.position(),15); // 10 + (1000 + 50 - 1045)
+  t.mock.timers.tick(2000); assert.equal(control.position(),17);
+  receive(tv({phase:'paused',entry_id:'gone',job_id:'jb'}));
+  assert.equal(control.reconcile(room).current_id,'gone'); assert.equal(control.entry.title,'B'); assert.equal(control.position(),10);
+  receive(tv({phase:'locked'})); assert.equal(control.state.playing,false);
+  assert.deepEqual(control.pendingFinishes,[]); assert.deepEqual(control.save(),{});
+});
+
+test('a remote keeps its chosen display and never switches to another one by itself', async () => {
+  const chosen=[];
+  const {control,receive,tv,sent}=remoteControl({choose:id => chosen.push(id)});
+  receive(tv({},{id:'one'}),tv({},{id:'two'}));
+  assert.equal(control.phase,'choose'); assert.equal(await control.command('pause'),'offline');
+  control.select('two'); receive(tv({},{id:'one'}));
+  assert.equal(control.phase,'offline'); assert.equal(control.entry,null);
+  assert.equal(await control.command('next'),'offline'); assert.deepEqual(sent,[]);
+  receive(tv({},{id:'one'}),tv({},{id:'two'})); assert.equal(control.phase,'playing'); assert.deepEqual(chosen,['two']);
+});
+
+test('a remote sends absolute values, shows them while waiting, and restores reality without an answer', async t => {
+  t.mock.timers.enable({apis:['setTimeout']});
+  const {control,receive,tv,sent}=remoteControl();
+  receive(tv());
+  const lead=control.command('toggle_lead');
+  assert.equal(control.state.levels.lead_vocals,.6);
+  assert.deepEqual(sent[0],{path:'/v1/remote/displays/tv/commands',command_id:'c1',session:'s1',action:'lead',entry_id:'a',level:.6});
+  receive(tv({lead:.6},{results:[{command_id:'c1',status:'applied'}]}));
+  assert.equal(await lead,'applied'); assert.equal(control.state.levels.lead_vocals,.6);
+  const seek=control.command('seek',{position:90}); assert.equal(control.position(),90);
+  t.mock.timers.tick(3000);
+  assert.equal(await seek,'timeout'); assert.equal(control.position(),10);
+  const pitch=control.command('pitch',{pitch_semitones:2}); assert.equal(control.state.pitch_semitones,2);
+  receive(tv({},{results:[{command_id:'c3',status:'unavailable'}]}));
+  assert.equal(await pitch,'unavailable'); assert.equal(control.state.pitch_semitones,0);
+  const {control:broken,receive:get}=remoteControl({send:async () => { throw new Error('播放屏已断开'); }});
+  get(tv()); assert.equal(await broken.command('pause'),'播放屏已断开'); assert.equal(broken.state.playing,true);
+});
+
+test('changing a remote role reopens the room stream and delivers its extra events', () => {
+  const streams=[], got=[], opened=[]; let role={};
+  class Stream extends EventTarget { close() { this.closed=true; } }
+  const events=new RoomEvents(()=>{},()=>{},url=>{ const stream=new Stream(); stream.url=url; streams.push(stream); return stream; },()=>0,
+    {query:()=>role,connected:()=>opened.push(streams.length),events:{remote_command:value=>got.push(value)}});
+  try {
+    events.connect('job'); events.connect('job'); assert.equal(streams.length,1);
+    assert.equal(streams[0].url,'/v1/room/events?job_id=job');
+    role={display_id:'tv',display_session:'tab'}; events.connect('job'); assert.equal(streams.length,2); assert.equal(streams[0].closed,true);
+    assert.equal(streams[1].url,'/v1/room/events?display_id=tv&display_session=tab&job_id=job');
+    const data=JSON.stringify({id:1});
+    streams[0].dispatchEvent(new MessageEvent('remote_command',{data}));
+    streams[1].dispatchEvent(new MessageEvent('remote_command',{data}));
+    streams[1].dispatchEvent(new MessageEvent('room',{data:JSON.stringify({entries:[]})}));
+    assert.deepEqual(got,[{id:1}]); assert.deepEqual(opened,[2]);
+    role={display_id:'tv',display_session:'next'}; events.connect('job'); assert.equal(streams.length,3);
+  } finally { events.close(); }
+});

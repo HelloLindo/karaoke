@@ -2,14 +2,15 @@
 import asyncio
 import json
 import time
-from collections import Counter
+from collections import Counter, deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlencode
 from uuid import uuid4
 
 from fastapi import HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .cache import can_restore_video
 from .job_schema import JobRequest, download_backoff, playback_version, thumbnail_url
@@ -46,6 +47,53 @@ class RoomCommand(BaseModel):
     pitch_semitones: int | None = Field(default=None, ge=-6, le=6, strict=True)
 
 
+REMOTE_ID = r'^[\w.:-]{1,80}$'
+
+
+class RemoteCommand(BaseModel):
+    """Absolute values only: delivering a command twice must not toggle twice."""
+    model_config = ConfigDict(extra='forbid')
+    command_id: str = Field(pattern=REMOTE_ID)
+    session: str = Field(pattern=REMOTE_ID)
+    action: Literal['play', 'pause', 'restart', 'next', 'remove', 'seek', 'lead', 'pitch']
+    entry_id: str | None = Field(default=None, max_length=80)
+    position: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    level: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    pitch_semitones: int | None = Field(default=None, ge=-6, le=6, strict=True)
+
+    @model_validator(mode='after')
+    def complete(self):
+        # Only play may target an empty playlist: it means "keep waiting to sing".
+        if self.entry_id is None and self.action not in ('play', 'lead'):
+            raise ValueError('entry_id is required')
+        value = dict(seek='position', lead='level', pitch='pitch_semitones').get(self.action)
+        if value and getattr(self, value) is None:
+            raise ValueError(f'{value} is required')
+        return self
+
+
+class RemoteResult(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    command_id: str = Field(pattern=REMOTE_ID)
+    status: Literal['applied', 'stale', 'expired', 'locked', 'unavailable', 'failed']
+
+
+class RemoteState(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    session: str = Field(pattern=REMOTE_ID)
+    seq: int = Field(ge=0)
+    phase: Literal['locked', 'idle', 'waiting', 'loading', 'playing', 'paused', 'error']
+    entry_id: str | None = Field(default=None, max_length=80)
+    job_id: str | None = Field(default=None, max_length=80)
+    position: float = Field(ge=0, allow_inf_nan=False)
+    started_at: float | None = Field(default=None, allow_inf_nan=False)
+    lead: float = Field(ge=0, le=1, allow_inf_nan=False)
+    lead_restore: float = Field(ge=0, le=1, allow_inf_nan=False)
+    pitch: int = Field(ge=-6, le=6)
+    intro_start: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    results: list[RemoteResult] = Field(default=[], max_length=32)
+
+
 class AddSong(BaseModel):
     model_config = ConfigDict(extra='forbid')
     url: str | None = Field(default=None, max_length=2048)
@@ -69,8 +117,9 @@ class Updates:
             if queue.empty():
                 queue.put_nowait(True)
 
-    async def events(self, snapshot):
-        queue = asyncio.Queue(maxsize=1)
+    async def events(self, snapshot, queue=None):
+        # A caller's own queue lets it wake this one stream without a broadcast.
+        queue = asyncio.Queue(maxsize=1) if queue is None else queue
         self.subscribers.add(queue)
         try:
             while True:
@@ -103,6 +152,8 @@ class RoomFeed:
 
     def frame(self, previous, job_id=None):
         generation = self.room.updates.generation
+        if previous == generation:
+            return ()  # Woken for something else; this viewer already has the room.
         if generation != self.generation:
             data = self.room.snapshot()
             data.pop('server_time')
@@ -139,11 +190,113 @@ class RoomFeed:
         return (body, f',"server_time":{time.time()},"playback_entry":{self.personal[job_id]}}}\n\n'.encode())
 
 
+@dataclass
+class RemoteDisplay:
+    session: str
+    name: str
+    streams: set = field(default_factory=set)
+    mailbox: list = field(default_factory=list)
+    seq: int = -1
+    state: dict | None = None
+    results: deque = field(default_factory=lambda: deque(maxlen=16))
+
+
+class RemoteHub:
+    """Relay commands to a display that opted in; the display owns its playback.
+
+    Everything is in memory and nothing here advances a clock or a room
+    revision. Losing it costs the remotes their view, never the performance.
+    """
+    EXPIRES, GRACE, LIMIT = 5, 3, 16
+
+    def __init__(self):
+        self.displays, self.watchers, self.version = {}, set(), 0
+
+    @staticmethod
+    def wake(queues):
+        for queue in tuple(queues):
+            if queue.empty():
+                queue.put_nowait(True)
+
+    def changed(self):
+        self.version += 1
+        self.wake(self.watchers)
+
+    def connect(self, display_id, session, name, queue):
+        display = self.displays.get(display_id)
+        if display is None or display.session != session:
+            # A tab handover starts over; commands for the old tab die with it.
+            display = self.displays[display_id] = RemoteDisplay(session, name)
+            self.changed()
+        display.name = name
+        display.streams.add(queue)
+        return display
+
+    def disconnect(self, display_id, display, queue):
+        display.streams.discard(queue)
+
+        def forget():
+            if not display.streams and self.displays.get(display_id) is display:
+                del self.displays[display_id]
+                self.changed()
+
+        # Changing songs reopens the event stream, which is not going offline.
+        if not display.streams:
+            asyncio.get_running_loop().call_later(self.GRACE, forget)
+
+    def find(self, display_id, session):
+        display = self.displays.get(display_id)
+        if display is None:
+            raise HTTPException(404, '播放屏已断开')
+        if display.session != session:
+            raise HTTPException(409, '播放屏已换到另一个标签页')
+        return display
+
+    def command(self, display_id, command):
+        display, now = self.find(display_id, command.session), time.time()
+        display.mailbox = [item for item in display.mailbox if item['expires_at'] > now]
+        if any(item['command_id'] == command.command_id for item in display.mailbox):
+            return
+        if len(display.mailbox) >= self.LIMIT:
+            raise HTTPException(429, '操作太快，请稍后再试')
+        display.mailbox.append(dict(command.model_dump(exclude_none=True), expires_at=now+self.EXPIRES))
+        self.wake(display.streams)
+
+    def report(self, display_id, state):
+        display = self.find(display_id, state.session)
+        if state.seq <= display.seq:
+            raise HTTPException(409, '播放状态已过期')
+        data = state.model_dump(exclude={'session', 'seq', 'results'})
+        results = [result.model_dump() for result in state.results]
+        done = {result['command_id'] for result in results}
+        display.mailbox = [item for item in display.mailbox if item['command_id'] not in done]
+        display.seq, display.state = state.seq, data
+        known = {result['command_id'] for result in display.results}
+        display.results.extend(result for result in results if result['command_id'] not in known)
+        self.changed()
+
+    @staticmethod
+    def commands(display, sent):
+        """Unacknowledged commands, so a reopened stream delivers them again."""
+        now = time.time()
+        for item in display.mailbox:
+            if item['command_id'] not in sent and item['expires_at'] > now:
+                sent.add(item['command_id'])
+                yield f'event: remote_command\ndata: {RoomFeed.encode(item)}\n\n'.encode()
+
+    def snapshot(self):
+        displays = [dict(id=ident, name=display.name, session=display.session, state=display.state,
+                         results=list(display.results))
+                    for ident, display in self.displays.items() if display.state]
+        return f'event: remote\ndata: {RoomFeed.encode(dict(displays=displays))}\n\n'.encode()
+
+
 class Room:
     def __init__(self, store, worker, version, updates):
         self.store, self.worker, self.version, self.updates = store, worker, version, updates
         self.playing_connections = Counter()
         self.feed = RoomFeed(self)
+        self.remote = RemoteHub()
         with store.connect() as db:
             db.execute('CREATE TABLE IF NOT EXISTS room (id INTEGER PRIMARY KEY, state TEXT NOT NULL)')
             initial = dict(entries=[], history=[], current_id=None, playing=False, position=0,
@@ -242,7 +395,7 @@ class Room:
                 'preparation_jobs': list(self.worker.processes),
                 'storage': self.store.cache.snapshot(), 'library': self.library(jobs=jobs, featured=featured)}
 
-    async def events(self, job_id=None, playing_entry_id=None):
+    async def events(self, job_id=None, playing_entry_id=None, *, display=None, watch=False):
         # A second device may finish/remove the shared queue entry while this
         # browser is still singing. Keep its media until the connection closes.
         leased = job_id if job_id and self.store.read(job_id) else None
@@ -255,20 +408,32 @@ class Room:
             if self.playing_connections[playing] == 1:
                 self.updates.publish()
 
-        previous = None
+        previous, watched, sent = None, None, set()
+        queue = asyncio.Queue(maxsize=1)
+        registered = self.remote.connect(*display, queue) if display else None
+        if watch:
+            self.remote.watchers.add(queue)
 
         def snapshot():
-            nonlocal previous
+            nonlocal previous, watched
             frame = self.feed.frame(previous, leased)
             previous = self.feed.generation
-            return frame
+            yield from frame
+            if registered:
+                yield from self.remote.commands(registered, sent)
+            if watch and watched != self.remote.version:
+                watched = self.remote.version
+                yield self.remote.snapshot()
 
-        stream = self.updates.events(snapshot)
+        stream = self.updates.events(snapshot, queue)
         try:
             async for event in stream:
                 yield event
         finally:
             await stream.aclose()
+            self.remote.watchers.discard(queue)
+            if display and registered:
+                self.remote.disconnect(display[0], registered, queue)
             if leased:
                 self.store.cache.release(leased)
             if playing:

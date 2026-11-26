@@ -139,6 +139,7 @@ flowchart LR
 
 1. 在 iPad、手机或电脑上打开点歌台，选歌并进入全屏。同一 Wi-Fi 下直接用电脑的局域网 IP 地址就能播放和升降调，无需域名或 HTTPS 证书。
 2. 用 HDMI 输出，或把整个屏幕镜像到电视，并确认网页声音也从电视输出。本项目的音轨与视频分开播放，仅投送视频文件可能没有伴奏。iPad 可参考 Apple 的[屏幕镜像](https://support.apple.com/zh-cn/102661)与[有线转接器说明](https://support.apple.com/zh-cn/108399)。
+   也可以让手机或平板只当遥控器：在接电视的播放设备上打开「正在播放」页的「遥控」，手机打开网址加 `/?remote=1`，就能控制电视上的播放，自身不出声。
 3. 将电视的声音送入混音设备的伴奏输入，麦克风或其无线接收器接入对应的麦克风输入，再由音响同时播放伴奏和你的歌声。
 4. 用音响／混音器调节自己的麦克风音量；网页里的「主唱」音量调节的是歌曲原唱，实时升降调也只处理歌曲音轨。当前网页不接收或处理你的麦克风声音。
 
@@ -150,7 +151,7 @@ flowchart LR
 
 - 给 B 站、网易云等平台增加点歌入口，或加入本地音视频导入。
 - 导入自己的歌单，加收藏、练歌记录，按自己的习惯整理曲库。
-- 做适合家里电视的大屏界面，或把手机做成专用遥控器。
+- 做适合家里电视的大屏界面。
 - 换主题、字体和字幕样式，增加其他语言的注音，尝试不同的分离或对齐模型。
 
 这些只是改造思路，欢迎按自己的需求继续发挥。也可以直接让编程助手帮忙，例如：
@@ -166,7 +167,7 @@ flowchart LR
 - [安装与模型准备](SETUP.md)：环境、固定版本的上游源码、权重位置、验证命令。
 - [网页使用说明](karaoke/APP.md)：点歌、播放、主唱音量和多设备播放。
 - [API](karaoke/API.md)：请求、任务状态、成品下载和环境变量。
-- [界面设计](karaoke/docs/design/app.md) · [字幕设计](karaoke/docs/design/subtitles.md)。
+- [界面设计](karaoke/docs/design/app.md) · [遥控设计](karaoke/docs/design/remote-control.md) · [字幕设计](karaoke/docs/design/subtitles.md)。
 - [切字验收](karaoke/docs/word-onset-metrics.md) · [主唱／伴唱验收](karaoke/docs/lead-backing-metrics.md) · [整体验收](karaoke/ACCEPTANCE.md)。
 - [自动质量检查](karaoke/docs/automatic-quality.md)：独立参考评分、疑点检查器的漏报／误报和故障注入验证。
 

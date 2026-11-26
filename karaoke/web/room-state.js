@@ -21,16 +21,18 @@ export function applyRoomPatch(current, patch) {
 // A quiet room still sends a heartbeat. Reopen a dead stream without polling
 // room state; the new subscription starts with the current complete snapshot.
 export class RoomEvents {
-  constructor(receive, connection, create = url => new EventSource(url), random = Math.random) {
-    Object.assign(this, {receive, connection, create, random, attempts:0});
+  // remote.query() names this page's role; its other keys handle extra events.
+  constructor(receive, connection, create = url => new EventSource(url), random = Math.random, remote = {}) {
+    Object.assign(this, {receive, connection, create, random, remote, attempts:0});
   }
   connect(job = '', playingEntry = '', force = false) {
-    if (this.source && job === this.job && playingEntry === this.playingEntry && !force) return;
-    if (job !== this.job || playingEntry !== this.playingEntry) this.attempts = 0;
-    this.close(); this.job = job; this.playingEntry = playingEntry;
+    const query = new URLSearchParams(this.remote.query?.() || {}), role = query.toString();
+    const changed = job !== this.job || playingEntry !== this.playingEntry || role !== this.role;
+    if (this.source && !changed && !force) return;
+    if (changed) this.attempts = 0;
+    this.close(); this.job = job; this.playingEntry = playingEntry; this.role = role;
     this.retrying = false;
     let snapshot = null;
-    const query = new URLSearchParams();
     if (job) query.set('job_id', job);
     if (playingEntry) query.set('playing_entry_id', playingEntry);
     const source = this.source = this.create('/v1/room/events' + (query.size ? `?${query}` : ''));
@@ -50,7 +52,12 @@ export class RoomEvents {
       this.attempts = 0;
       if (alive()) this.receive(snapshot);
     };
-    source.addEventListener('room', event => receive(event, false));
+    source.addEventListener('room', event => {
+      receive(event, false);
+      if (this.source === source && !this.retrying) this.remote.connected?.();
+    });
+    for (const [name, handle] of Object.entries(this.remote.events || {}))
+      source.addEventListener(name, event => { if (alive()) handle(JSON.parse(event.data)); });
     source.addEventListener('room_patch', event => receive(event, true));
     source.addEventListener('ping', () => { if (alive()) this.attempts = 0; });
     source.onopen = alive;

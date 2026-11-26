@@ -36,7 +36,9 @@ API 的依赖文件只安装服务依赖。新检出请按[安装说明](../SETU
 | `GET /v1/room` | 待唱 `entries`、倒序演唱记录 `history`、准备状态和兼容旧客户端的播放字段 |
 | `POST /v1/room/entries` | 传入 `{ "url": "..." }` 点新歌，或 `{ "job_id": "..." }` 复用已准备歌曲 |
 | `POST /v1/room/commands` | 网页共享操作：`finish`、`remove`、`reorder`、`retry`、`reprepare`；另保留旧客户端播放命令 |
-| `GET /v1/room/events` | 推送 `room` 完整快照、`room_patch` 增量更新；空闲时发送 `ping` |
+| `GET /v1/room/events` | 推送 `room` 完整快照、`room_patch` 增量更新；空闲时发送 `ping`；遥控事件见下文 |
+| `POST /v1/remote/displays/{id}/state` | 播放屏上报自己的播放状态与指令结果 |
+| `POST /v1/remote/displays/{id}/commands` | 向一台已允许遥控的播放屏发送一条指令，返回 202 |
 | `GET /v1/storage` | 缓存使用量、上限、受保护与可回收容量、准备空间是否足够 |
 | `POST /v1/storage` | `{ "limit_gib": 10 }` 修改并持久化上限；`null` 取消应用配额，仍保护实际磁盘余量，返回新的房间快照 |
 
@@ -64,7 +66,13 @@ API 的依赖文件只安装服务依赖。新检出请按[安装说明](../SETU
 
 取消后的已完成阶段检查点、来源文件和诊断仍保留在原缓存预算内，未完成阶段的临时文件清理。再次点歌会复用同一任务，逐阶段验证输入、模型、代码和产物哈希后继续；取消过程中重新点歌，先等待旧进程退出，随后只启动一次恢复任务。其他待唱条目仍引用同一任务时不取消，独立 probe 的生命周期仍由其控制器管理。
 
-浏览器用同一个 Web Audio 时钟播放按需分段的 FLAC 音轨，MV 静音跟随。每个设备独立负责自己的声音与画面，旧的 `/?remote=1` 也正常播放。完整说明见 [APP.md](APP.md)。
+浏览器用同一个 Web Audio 时钟播放按需分段的 FLAC 音轨，MV 静音跟随。每个设备独立负责自己的声音与画面。`/?remote=1` 是遥控页，不播放声音。完整说明见 [APP.md](APP.md)。
+
+### 遥控
+
+播放屏连接 SSE 时带 `display_id`、`display_session` 和可选的 `display_name`，收到 `remote_command`；遥控带 `watch=1`，收到 `remote`，内容是在线播放屏的状态和最近的指令结果。两种角色不能同时使用。状态只在变化时上报，不推进房间修订号，也不发给普通连接；`started_at` 使用服务端时钟，遥控据此推算进度。
+
+指令体为 `{command_id, session, action, entry_id}`，`action` 是 `play`、`pause`、`restart`、`next`、`remove`、`seek`（`position`）、`lead`（`level`）或 `pitch`（`pitch_semitones`），均传绝对值。除 `play` 和 `lead` 外必须带 `entry_id`。`session` 必须是播放屏当前会话，否则返回 409；未开放或已离线返回 404；未执行的指令超过 16 条返回 429。指令 5 秒后失效，连接重建时只重发未确认且未过期的指令。播放屏返回 `applied`、`stale`、`expired`、`locked`、`unavailable` 或 `failed`。这些内容只在内存里，服务重启后由播放屏重新上报。设计说明见[遥控设计](docs/design/remote-control.md)。
 
 ### 分段播放
 

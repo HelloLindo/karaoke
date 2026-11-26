@@ -13,7 +13,16 @@ from fastapi.testclient import TestClient
 
 from karaoke.api import Store, Worker, create_app
 from karaoke.job_schema import JobRequest
-from karaoke.room import AddSong, Room, RoomCommand, Updates
+from karaoke.room import (
+    AddSong,
+    RemoteCommand,
+    RemoteDisplay,
+    RemoteHub,
+    RemoteState,
+    Room,
+    RoomCommand,
+    Updates,
+)
 from karaoke.test_api import URL, cache_fixture, fake_worker, finished
 
 
@@ -1252,6 +1261,168 @@ def test_sse_preserves_reorder_removal_and_private_playback(tmp_path):
             await stream.aclose()
         assert not store.cache.leases and not room.playing_connections
     asyncio.run(check())
+
+
+class RemoteStream:
+    """One browser's event stream, read one whole event at a time."""
+    def __init__(self, room, **kwargs):
+        self.stream = room.events(**kwargs)
+
+    async def next(self, timeout=1):
+        text = ''
+        while not text.endswith('\n\n'):
+            chunk = await asyncio.wait_for(anext(self.stream), timeout)
+            text += chunk if isinstance(chunk, str) else chunk.decode()
+        kind, data = text.strip().split('\n', 1)
+        return kind.removeprefix('event: '), json.loads(data.removeprefix('data: '))
+
+    async def close(self):
+        await self.stream.aclose()
+
+
+def remote_state(seq=0, session='tab', **changes):
+    return RemoteState.model_validate({**dict(session=session, seq=seq, phase='paused', entry_id='song', job_id='job',
+        position=12., lead=0., lead_restore=1., pitch=0), **changes})
+
+
+def remote_command(ident='one', session='tab', **changes):
+    return RemoteCommand.model_validate({**dict(command_id=ident, session=session, action='pause', entry_id='song'), **changes})
+
+
+def test_remote_commands_reach_only_their_display_and_never_touch_the_room(tmp_path):
+    app = create_app(tmp_path, version='test')
+    room, hub = app.state.room, app.state.room.remote
+
+    async def check():
+        display = RemoteStream(room, display=('tv', 'tab', 'Mac'))
+        other = RemoteStream(room, display=('other', 'tab', 'PC'))
+        viewer, watcher = RemoteStream(room), RemoteStream(room, watch=True)
+        streams = [display, other, viewer, watcher]
+        try:
+            for stream in streams:
+                assert (await stream.next())[0] == 'room'
+            assert await watcher.next() == ('remote', {'displays': []})  # Connected, but nothing reported yet.
+            generation, revision = room.updates.generation, room.read()['revision']
+            hub.report('tv', remote_state())
+            kind, data = await watcher.next()
+            assert kind == 'remote'
+            assert [(d['id'], d['name'], d['session'], d['state']['position']) for d in data['displays']] == [('tv', 'Mac', 'tab', 12.)]
+            hub.command('tv', remote_command())
+            kind, command = await display.next()
+            assert (kind, command['command_id'], command['action']) == ('remote_command', 'one', 'pause')
+            assert 0 < command['expires_at'] - time.time() <= hub.EXPIRES
+            hub.report('tv', remote_state(1, position=13., results=[dict(command_id='one', status='applied')]))
+            assert (await watcher.next())[1]['displays'][0]['results'] == [dict(command_id='one', status='applied')]
+            # No broadcast, no queue revision, and not one byte for anyone else.
+            assert (room.updates.generation, room.read()['revision']) == (generation, revision)
+            for stream in (other, viewer, display):
+                with pytest.raises(TimeoutError):
+                    await stream.next(.02)
+        finally:
+            for stream in streams:
+                await stream.close()
+    asyncio.run(check())
+
+
+def test_remote_command_survives_a_reopened_stream_once_but_never_outlives_its_deadline(tmp_path, monkeypatch):
+    room = create_app(tmp_path, version='test').state.room
+    hub = room.remote
+
+    async def check():
+        first = RemoteStream(room, display=('tv', 'tab', 'Mac'))
+        await first.next()
+        hub.command('tv', remote_command('lost', action='next'))
+        assert (await first.next())[1]['command_id'] == 'lost'
+        await first.close()  # The connection died before the display answered.
+        hub.command('tv', remote_command('while-away'))
+        hub.command('tv', remote_command('while-away'))  # The remote retried its request.
+        second = RemoteStream(room, display=('tv', 'tab', 'Mac'))
+        assert (await second.next())[0] == 'room'
+        assert [(await second.next())[1]['command_id'] for _ in range(2)] == ['lost', 'while-away']
+        hub.report('tv', remote_state(results=[dict(command_id='lost', status='applied'), dict(command_id='while-away', status='stale')]))
+        await second.close()
+        hub.command('tv', remote_command('late', action='next'))
+        now = time.time()
+        with monkeypatch.context() as patch:
+            patch.setattr(time, 'time', lambda: now+hub.EXPIRES+1)
+            third = RemoteStream(room, display=('tv', 'tab', 'Mac'))
+            assert (await third.next())[0] == 'room'
+            with pytest.raises(TimeoutError):
+                await third.next(.02)
+            await third.close()
+    asyncio.run(check())
+
+
+def test_remote_display_goes_offline_after_a_grace_and_a_handover_rejects_the_old_tab(tmp_path, monkeypatch):
+    monkeypatch.setattr(RemoteHub, 'GRACE', .02)
+    room = create_app(tmp_path, version='test').state.room
+    hub = room.remote
+
+    async def check():
+        with pytest.raises(HTTPException) as missing:
+            hub.command('tv', remote_command())  # A device that never opted in cannot be addressed.
+        assert missing.value.status_code == 404
+        old = RemoteStream(room, display=('tv', 'tab', 'Mac'))
+        await old.next()
+        hub.report('tv', remote_state(5))
+        with pytest.raises(HTTPException) as stale:
+            hub.report('tv', remote_state(5))
+        assert stale.value.status_code == 409
+        new = RemoteStream(room, display=('tv', 'next-tab', 'Mac'))
+        await new.next()
+        for call in (lambda: hub.report('tv', remote_state(6)), lambda: hub.command('tv', remote_command())):
+            with pytest.raises(HTTPException) as replaced:
+                call()
+            assert replaced.value.status_code == 409
+        await old.close()
+        await asyncio.sleep(.05)
+        hub.report('tv', remote_state(0, 'next-tab'))  # The old tab leaving must not take the new one down.
+        await new.close()
+        hub.command('tv', remote_command(session='next-tab'))  # Still within the grace of a song change.
+        await asyncio.sleep(.05)
+        with pytest.raises(HTTPException) as offline:
+            hub.command('tv', remote_command(session='next-tab'))
+        assert offline.value.status_code == 404
+        assert not hub.displays and not hub.watchers
+    asyncio.run(check())
+
+
+def test_remote_mailbox_is_bounded_and_a_room_update_is_not_resent_to_a_woken_stream(tmp_path):
+    room = create_app(tmp_path, version='test').state.room
+    hub = room.remote
+
+    async def check():
+        display = RemoteStream(room, display=('tv', 'tab', 'Mac'))
+        await display.next()
+        for number in range(hub.LIMIT):
+            hub.command('tv', remote_command(f'c{number}'))
+        with pytest.raises(HTTPException) as full:
+            hub.command('tv', remote_command('overflow'))
+        assert full.value.status_code == 429
+        assert [(await display.next())[0] for _ in range(hub.LIMIT)] == ['remote_command']*hub.LIMIT
+        room.updates.publish()
+        assert (await display.next())[0] == 'room_patch'
+        await display.close()
+    asyncio.run(check())
+
+
+def test_remote_endpoints_validate_roles_and_commands(tmp_path):
+    app = create_app(tmp_path, version='test')
+    with TestClient(app) as client:
+        for query in ('watch=1&display_id=tv&display_session=tab', 'display_id=tv', 'display_session=tab', 'display_id=a%20b&display_session=tab'):
+            assert client.get(f'/v1/room/events?{query}').status_code == 422
+        valid = dict(command_id='one', session='tab', action='pause', entry_id='song')
+        assert client.post('/v1/remote/displays/tv/commands', json=valid).status_code == 404
+        for change in (dict(action='toggle_lead'), dict(entry_id=None), dict(action='seek'), dict(action='seek', position=-1),
+                       dict(action='lead', level=1.1), dict(action='pitch', pitch_semitones=7), dict(command_id='a b'), dict(extra=1)):
+            assert client.post('/v1/remote/displays/tv/commands', json={**valid, **change}).status_code == 422, change
+        assert client.post('/v1/remote/displays/tv/commands', json={**valid, 'action': 'play', 'entry_id': None}).status_code == 404
+        assert client.post('/v1/remote/displays/tv/state', json=remote_state().model_dump()).status_code == 404
+        assert client.post('/v1/remote/displays/tv/state', json={**remote_state().model_dump(), 'phase': 'other'}).status_code == 422
+        app.state.room.remote.displays['tv'] = RemoteDisplay('tab', 'Mac')
+        # The page parses every reply as JSON; an empty body would look like a failed report.
+        assert client.post('/v1/remote/displays/tv/state', json=remote_state().model_dump()).json() == {'seq': 0}
+        assert client.post('/v1/remote/displays/tv/commands', json=valid).json() == {'command_id': 'one'}
 
 
 def test_progress_is_received_before_worker_exits(tmp_path):

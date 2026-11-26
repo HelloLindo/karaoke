@@ -85,7 +85,7 @@
     </section>
 
     <section class="main-panel player-panel" id="player-view" hidden aria-label="播放器">
-      <div class="section-heading player-heading"><div><h1 id="player-title">未播放</h1><div class="song-info-row"><p id="player-artist"></p><span id="player-elapsed"></span></div></div><button class="icon-button" id="fullscreen" aria-label="全屏播放" title="全屏 · F"><svg class="icon"><use href="#i-full"/></svg></button></div>
+      <div class="section-heading player-heading"><div><h1 id="player-title">未播放</h1><div class="song-info-row"><p id="player-artist"></p><span id="player-elapsed"></span></div></div><div class="player-tools"><select id="remote-target" class="remote-target" aria-label="要遥控的播放屏" hidden></select><button class="remote-toggle" id="remote-toggle" aria-pressed="false" title="允许同一网络的手机或平板控制这里的播放">遥控：关</button><button class="icon-button" id="fullscreen" aria-label="全屏播放" title="全屏 · F"><svg class="icon"><use href="#i-full"/></svg></button></div></div>
       <div class="player-stage" id="player-stage">
       <div class="screen" id="screen">
         <video id="video" playsinline muted preload="none" aria-label="卡拉 OK 字幕 MV"></video>

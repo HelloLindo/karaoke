@@ -1,5 +1,6 @@
 import { Player } from './player.js';
 import { mountPreview } from './preview.js';
+import { RemoteControl, RemoteDisplay, REMOTE_ERRORS } from './remote.js';
 import { isStaleRoomSnapshot, LocalPlayback, PlaybackTabs, RoomEvents, queueToTop, queueTopCandidates, preparationRetry } from './room-state.js';
 import { createVideoSearch, createViewHistory, previewURL, searchLibrary, artistLibrarySongs, librarySongs, libraryArtists, songArtists, paginateSongs, filterSongs, playCount, orderResults, queueKey, queuePosition, queuePositions, historySuggestions, lyricLabel } from './search.js';
 
@@ -11,9 +12,11 @@ let savedPlayback;
 try { savedPlayback = JSON.parse(sessionStorage.getItem('karaokePlayback')); } catch { /* Start fresh if tab storage is unavailable or invalid. */ }
 let tabStorage;
 try { tabStorage = localStorage; } catch { /* PlaybackTabs also supports in-memory state. */ }
-const tabs = new PlaybackTabs(tabStorage, `${Date.now()}-${Math.random()}`, savedPlayback);
-let playback = new LocalPlayback(tabs.read().playback);
-if (!tabs.record.owner) tabs.write(playback.save(), {claim:true});
+// A remote page never owns playback: it has no claim to write and no tab to follow.
+const remote = new URLSearchParams(location.search).get('remote') === '1' ? createRemote() : null;
+const tabs = new PlaybackTabs(remote ? null : tabStorage, `${Date.now()}-${Math.random()}`, savedPlayback);
+let playback = remote || new LocalPlayback(tabs.read().playback);
+if (!remote && !tabs.record.owner) tabs.write(playback.save(), {claim:true});
 let tabChange = tabs.record.change;
 let finishRetry, finishSending, finishDelay = 1000, queueSyncError = false, connected = false;
 let roomState = {entries:[], revision:0}, receivedRoom = false, viewRevision = 0, lastPlaybackSave = 0;
@@ -99,6 +102,7 @@ async function command(action, extra = {}, claim = !['ready','buffering'].includ
   try {
     if (['play','pause','seek','restart','next','lead','toggle_lead','pitch','ready','buffering'].includes(action) ||
         (action === 'remove' && extra.entry_id === state.current_id)) {
+      if (remote) return await remoteCommand(action, extra);
       if (!claim && !tabs.owns()) return null;
       if (extra.revision !== undefined && extra.revision !== state.revision) return null;
       const claimed = claim && claimPlayback();
@@ -121,6 +125,91 @@ async function command(action, extra = {}, claim = !['ready','buffering'].includ
 function renderConnection() {
   $('connection-dot').classList.toggle('online', connected && !queueSyncError);
   $('connection-text').textContent = queueSyncError ? '队列待同步' : connected ? '在线' : '正在重连';
+}
+
+// The audio device is the only honest signal: after a reload Safari reports
+// past activation while resume() waits forever for a new gesture.
+const soundLocked = () => player.context?.state !== 'running';
+function displayPhase() {
+  const song = current();
+  if (loadError) return 'error';
+  if (!state.playing) return !song ? 'idle' : soundLocked() ? 'locked' : 'paused';
+  if (soundLocked()) return 'locked';
+  if (song?.status !== 'completed') return 'waiting';
+  return playback.state.started_at === null ? 'loading' : 'playing';
+}
+
+function createRemote() {
+  const key = 'karaokeRemoteTarget';
+  let chosen = null;
+  try { chosen = sessionStorage.getItem(key); } catch { /* Choose again after a reload. */ }
+  return new RemoteControl({chosen, clockOffset:() => clockOffset, send:(path, body) => request(path, body, 5000),
+    changed:() => renderState(),
+    choose:id => { try { sessionStorage.setItem(key, id); } catch { /* The choice lasts as long as this page. */ } }});
+}
+
+async function remoteCommand(action, extra) {
+  const status = await remote.command(action, extra);
+  if (status === 'applied') return state;
+  toast(REMOTE_ERRORS[status] || status);
+  return null;
+}
+
+function remoteStatus() {
+  return {offline:remote.chosen ? '播放屏已断开' : '没有可遥控的播放屏', choose:'请选择播放屏', locked:'请先在播放屏上点一次播放',
+    error:'播放屏加载失败，点播放重试', loading:'播放屏正在加载', waiting:current() ? '播放屏正在等待歌曲' : '准备好后自动接唱', idle:'请先点歌', paused:'已暂停', playing:'正在播放屏上播放'}[remote.phase];
+}
+
+function renderRemote() {
+  const {displays, display:target, chosen} = remote;
+  $('now-artist').textContent = target && remote.phase !== 'locked' ? `遥控 ${target.name}` : remoteStatus();
+  const named = name => displays.filter(item => item.name === name);
+  const options = [...displays.map(item => [item.id, item.name + (named(item.name).length > 1 ? ` ${named(item.name).indexOf(item)+1}` : '') +
+    (['playing','loading'].includes(item.state.phase) ? '（播放中）' : '')]), ...(chosen && !target ? [[chosen, '已断开的播放屏']] : [])];
+  if (!chosen) options.unshift(['', '请选择播放屏']);
+  const signature = JSON.stringify([options, chosen]);
+  if ($('remote-target').dataset.signature !== signature) {
+    $('remote-target').dataset.signature = signature;
+    $('remote-target').replaceChildren(...options.map(([id, name]) => new Option(name, id, false, id === (chosen || ''))));
+  }
+  $('remote-target').hidden = options.length < 2;
+  $('lead-toggle').disabled = !target;
+  if (!target) for (const id of ['play-toggle','transport-restart','next-song','seek','lead-down','lead-up','pitch-down','pitch-up'])
+    $(id).disabled = true;
+}
+
+function updateRemoteCover(song) {
+  $('skip-intro').toggleAttribute('hidden', introSkipTarget() === null);
+  $('screen-start').toggleAttribute('hidden', true);
+  $('screen-cover').toggleAttribute('hidden', false);
+  const status = song && song.status !== 'completed' ? statusText(song) : remoteStatus();
+  if ($('screen-status').textContent !== status) $('screen-status').textContent = status;
+  const retry = preparationRetry(song);
+  $('screen-retry').toggleAttribute('hidden', !retry || retry.action !== 'retry' || !state.entries.some(e => e.id === song.id));
+}
+
+function renderRemoteToggle() {
+  const {enabled} = displaySettings();
+  $('remote-toggle').textContent = `遥控：${enabled ? '开' : '关'}`;
+  $('remote-toggle').setAttribute('aria-pressed', String(enabled));
+}
+
+function setupRemote() {
+  document.body.classList.toggle('is-remote', Boolean(remote));
+  $('remote-toggle').hidden = Boolean(remote);
+  $('fullscreen').hidden = Boolean(remote);
+  if (remote) {
+    $('remote-target').onchange = event => { remote.select(event.target.value); renderState(); };
+    setInterval(() => { if (state.playing && !document.hidden) updateTime(remote.position()); }, 250);
+    return;
+  }
+  renderRemoteToggle();
+  $('remote-toggle').onclick = () => {
+    const settings = displaySettings();
+    saveDisplaySettings({...settings, enabled:!settings.enabled});
+    renderRemoteToggle(); connectEvents();
+    if (!settings.enabled) toast('已允许遥控：在手机或平板的网址后加 /?remote=1 打开');
+  };
 }
 
 async function syncFinished() {
@@ -719,7 +808,7 @@ function updateTransport() {
   const poster = song?.poster || '';
   if ($('video').getAttribute('poster') !== poster) $('video').setAttribute('poster', poster);
   $('player-elapsed').innerHTML = preparationElapsedHTML(song);
-  const playingHere = tabs.owns() && state.playing && player.unlocked;
+  const playingHere = remote ? state.playing : tabs.owns() && state.playing && player.unlocked;
   $('play-icon').setAttribute('href', playingHere ? '#i-pause' : '#i-play');
   $('play-toggle').setAttribute('aria-label', playingHere ? '暂停' : '播放');
   $('play-toggle').disabled = !song && !state.playing;
@@ -735,10 +824,12 @@ function updateTransport() {
   $('pitch-down').disabled = pitch <= -6;
   $('pitch-up').disabled = pitch >= 6;
   renderMixer();
+  if (remote) renderRemote();
   updateCover();
 }
 
 function introSkipTarget() {
+  if (remote) return remote.introSkipTarget();
   return state.playing && tabs.owns() && player.unlocked && player.ready &&
     player.matches(current()) && !loading && !loadError
     ? player.introSkipTarget(playback.position()) : null;
@@ -746,6 +837,8 @@ function introSkipTarget() {
 
 function updateCover() {
   const song = current();
+  if (remote) { updateRemoteCover(song); return; }
+  display?.report();
   const startingVideo = Boolean(player.pendingStart || player.videoPreparation);
   $('skip-intro').toggleAttribute('hidden', startingVideo || introSkipTarget() === null);
   if (player.anchor === null || player.entry?.id !== song?.id)
@@ -764,7 +857,7 @@ function updateCover() {
 
 let countdownFrame = '';
 function updateTime(position) {
-  if (Date.now() - lastPlaybackSave > 1000) savePlayback(position);
+  if (!remote && Date.now() - lastPlaybackSave > 1000) savePlayback(position);
   const seek = $('seek');
   const value = Math.min(Number(seek.max), Math.round(Math.max(0, position) * 10) / 10);
   // The slider already displays tenths and the label displays seconds. Keep
@@ -898,12 +991,14 @@ function renderState() {
     renderQueue(); updateTransport(); renderStorage();
     updateAddButtons();
   }
-  if (!wasReady && state.playing && current()?.status === 'completed') switchView('player');
-  if (!player.anchor) updateTime(state.position);
+  if (!remote && !wasReady && state.playing && current()?.status === 'completed') switchView('player');
+  if (remote) updateTime(remote.position());
+  else if (!player.anchor) updateTime(state.position);
   syncPlayback();
 }
 
 async function activate() {
+  if (remote) return true; // The display decides; this device never makes sound.
   loadError = '';
   claimPlayback();
   const session = tabs.record.session;
@@ -914,6 +1009,7 @@ async function activate() {
 }
 
 async function togglePlay() {
+  if (remote) { await command(state.playing ? 'pause' : 'play'); return; }
   const wasUnlocked = tabs.owns() && player.unlocked;
   // Pause is an intent change, not a request to reactivate the audio device.
   if (state.playing && wasUnlocked) { await command('pause'); return; }
@@ -1129,6 +1225,7 @@ $('seek').oninput = () => { renderRange($('seek')); seeking = true; $('current-t
 $('seek').onchange = async () => { await command('seek', {position:Number($('seek').value)}); seeking = false; };
 try { sessionStorage.removeItem('karaokeVolume'); } catch { /* Clearing an obsolete preference is optional. */ }
 async function fullscreen() {
+  if (remote) return;
   switchView('player');
   try { if (document.fullscreenElement) await document.exitFullscreen(); else await $('player-stage').requestFullscreen(); }
   catch { toast('当前浏览器不支持全屏播放'); }
@@ -1162,7 +1259,34 @@ const events = new RoomEvents(acceptState, online => {
   if (connected === online) return;
   connected = online; renderConnection();
   if (online) retryFinished();
-});
+}, undefined, undefined, remote ? {query:() => ({watch:'1'}), events:{remote:value => remote.receive(value)}} :
+  {query:displayRole, connected:() => display.resync(), events:{remote_command:value => display.receive(value)}});
+const displayKey = 'karaokeRemoteDisplay';
+function displaySettings() {
+  let saved;
+  try { saved = JSON.parse(tabStorage.getItem(displayKey)); } catch { /* Private mode keeps this page's choice below. */ }
+  return saved || displaySettings.fallback || {id:crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`, enabled:false};
+}
+function saveDisplaySettings(value) {
+  displaySettings.fallback = value;
+  try { tabStorage.setItem(displayKey, JSON.stringify(value)); } catch { /* The choice lasts as long as this page. */ }
+}
+function displayName() {
+  const agent = navigator.userAgent;
+  // Android also names Linux, and an iPad calls itself a Mac with a touch screen.
+  const device = /Macintosh/.test(agent) ? navigator.maxTouchPoints > 1 ? 'iPad' : 'Mac' :
+    agent.match(/iPad|iPhone|Windows|Android/)?.[0] || agent.match(/Linux/)?.[0] || '播放屏';
+  const browser = /Edg\//.test(agent) ? 'Edge' : /Chrome\//.test(agent) ? 'Chrome' : /Firefox\//.test(agent) ? 'Firefox' : /Safari\//.test(agent) ? 'Safari' : '';
+  return device + (browser && ` · ${browser}`);
+}
+// Only the tab that owns playback is a display, and only after opting in.
+function displayRole() {
+  const settings = displaySettings();
+  if (!settings.enabled || !tabs.owns()) { display.stop(); return {}; }
+  display.id = settings.id;
+  display.start(tabs.record.session);
+  return {display_id:settings.id, display_session:tabs.record.session, display_name:displayName()};
+}
 function connectEvents() {
   // Protect an activated performance across pauses, but not an idle viewer's
   // automatic queue preselection (which has never loaded any media).
@@ -1198,7 +1322,10 @@ function claimPlayback() {
   syncFinished();
   return true;
 }
-window.addEventListener('storage', event => { if (event.key === tabs.key) followPlayback(); });
+window.addEventListener('storage', event => {
+  if (event.key === tabs.key) followPlayback();
+  if (event.key === displayKey && !remote) { renderRemoteToggle(); connectEvents(); }
+});
 window.addEventListener('online', () => { events.close(); connectEvents(); retryFinished(); });
 window.addEventListener('pagehide', () => {
   if (tabs.suspend(playback.save())) player.suspend();
@@ -1215,6 +1342,21 @@ function resumePage() {
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden) resumePage(); });
 window.addEventListener('pageshow', event => { if (event.persisted) resumePage(); });
+const display = remote ? null : new RemoteDisplay('', (path, body) => request(path, body, 10000), {
+  state:() => ({phase:displayPhase(), entry_id:current()?.id || null, job_id:current()?.job_id || null, position:state.position,
+    started_at:playback.state.started_at,
+    lead:state.levels.lead_vocals, lead_restore:playback.leadRestore, pitch:state.pitch_semitones || 0,
+    intro_start:player.ready && player.matches(current()) ? player.introSkipTarget(0) : null}),
+  entry:() => current()?.id || null,
+  locked:soundLocked,
+  pitchUnavailable:() => Boolean(player.pitchError),
+  run:async (action, extra) => {
+    // A running context needs no gesture, e.g. to retry after a failed load.
+    if (action !== 'remove' && !player.unlocked && !soundLocked()) await player.unlock();
+    return command(action, extra, false);
+  },
+}, () => clockOffset);
+setupRemote();
 connectEvents();
 updateTransport();
 if (!navigation.restore()) navigation.save();
